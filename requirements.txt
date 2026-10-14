@@ -1,0 +1,4 @@
+langchain>=1.4        # only for agent.py
+langchain-ollama>=1.1 # only for agent.py
+langgraph>=1.2        # only for agent.py
+requests>=2.31
