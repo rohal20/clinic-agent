@@ -158,6 +158,7 @@ def reschedule_appointment(booking_id: int, new_day: str, new_time: str) -> str:
 TOOLS = {
     "search_clinic_info": search_clinic_info,
     "find_available_slots": find_available_slots,
+    "list_doctors": list_doctors,
     "book_appointment": book_appointment,
     "my_appointments": my_appointments,
     "reschedule_appointment": reschedule_appointment,
@@ -208,8 +209,16 @@ TOOL_SCHEMAS = [
 
 ]
 
+DOCTOR_LIST = "\n".join(
+    f"- {doc['specialty'].title()}: {doc['name']} (id {doc_id}), works {', '.join(doc['days'])}"
+    for doc_id, doc in DOCTORS.items()
+)
 SYSTEM_PROMPT = f"""You are the appointment assistant for City Care Clinic (a demo clinic).
 Today is {date.today():%A %Y-%m-%d}.
+
+The clinic has ONLY these doctors:
+{DOCTOR_LIST}
+Never mention any other doctor or specialty.
 
 To book an appointment, follow these steps:
 1. Ask the patient for their name.
