@@ -43,16 +43,33 @@ BOOKINGS = []
 SHOWN_SLOTS = set()  # (doctor_id, date, time) slots the patient has been shown
 
 
+WEEKDAY_NAMES = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+DATE_FORMATS = ["%Y-%m-%d", "%A, %d %B %Y", "%A %d %B %Y", "%d %B %Y", "%d %B"]
+
+
 def to_date(day: str) -> date:
-    day = day.strip().lower()
-    if day == "today":
-        return date.today()
-    if day == "tomorrow":
-        return date.today() + timedelta(days=1)
-    try:
-        return date.fromisoformat(day)
-    except ValueError:
-        raise ValueError(f"'{day}' is not a valid day. Use today, tomorrow or YYYY-MM-DD.") from None
+    """Turn the patient's words into a real date. The code does date maths, not the LLM.
+    Accepts: today, tomorrow, day after tomorrow, a weekday ('friday', 'next fri'),
+    or a date ('2026-10-16', '16 October 2026')."""
+    text = day.strip().lower().removeprefix("next ").removeprefix("this ").strip()
+    today = date.today()
+    if text == "today":
+        return today
+    if text == "tomorrow":
+        return today + timedelta(days=1)
+    if text == "day after tomorrow":
+        return today + timedelta(days=2)
+    for index, name in enumerate(WEEKDAY_NAMES):
+        if text in (name, name[:3]):
+            return today + timedelta(days=(index - today.weekday()) % 7)  # the coming one (today counts)
+    for fmt in DATE_FORMATS:
+        try:
+            parsed = datetime.strptime(day.strip(), fmt).date()
+            return parsed.replace(year=today.year) if fmt == "%d %B" else parsed
+        except ValueError:
+            continue
+    raise ValueError(f"'{day}' is not a valid day. Use today, tomorrow, a weekday like friday, "
+                     "or a date like 2026-10-16.")
 
 
 def find_doctor(doctor: str) -> str | None:
@@ -111,15 +128,14 @@ def ask_patient_to_confirm(question: str) -> bool:
     return str(answer).strip().lower() in {"yes", "y"}
 
 
-@tool # turning functions into tools with @tool decorator, so the model can call them
-      # the model sees the docstring as a description of what the tool does, and the function signature as a JSON schema for its arguments
+@tool
 def search_clinic_info(question: str) -> str:
     """Search clinic information: fees, opening hours, location, payment and cancellation policy."""
     docs = retriever.invoke(question)
     return "\n\n".join(doc.page_content for doc in docs)
 
 
-@tool(return_direct=True) # the answer goes straight to the patient, so the model can't drop or change it
+@tool(return_direct=True)
 def list_doctors() -> str:
     """Show the patient all categories (specialties) with their doctors and working days."""
     lines = ["We have the following categories:"]
@@ -129,15 +145,14 @@ def list_doctors() -> str:
     lines.append("Which category would you like to book?")
     return "\n".join(lines)
 
-# list_doctors() and find_available_slots() are return_direct=True because the answers go straight to the patient
-# the other tools are not return_direct because they are more like actions (booking, rescheduling) and their output can be summarized by the model.
 
 @tool(return_direct=True)
 def find_available_slots(specialty: Literal["general", "dermatology", "pediatrics"], day: str) -> str:
     """Show the patient the free appointment times for a specialty on a day.
-    day is 'today', 'tomorrow' or YYYY-MM-DD."""
+    day: pass the patient's own words, e.g. 'friday', 'tomorrow', 'today' or a date.
+    Do not convert weekdays to dates yourself."""
     d = to_date(day)
-    lines = [f"Available times on {d:%A, %d %B %Y}:"]
+    lines = [f"Available times on {d:%A, %d %B %Y} ({d.isoformat()}):"]
     any_free = False
     for doctor_id, doctor in DOCTORS.items():
         if doctor["specialty"] != specialty:
@@ -187,7 +202,8 @@ def my_appointments(patient_name: str) -> str:
 @tool
 def reschedule_appointment(booking_id: int, new_day: str, new_time: str) -> str:
     """Move an appointment to a new day and time with the same doctor, after showing free times
-    with find_available_slots. new_day is YYYY-MM-DD, new_time is HH:MM."""
+    with find_available_slots. new_day is the patient's words (e.g. 'friday') or YYYY-MM-DD,
+    new_time is HH:MM."""
     booking = next((b for b in BOOKINGS if b["id"] == int(booking_id)), None)
     if booking is None:
         return f"Error: no booking found with id {booking_id}."
@@ -215,17 +231,25 @@ TOOLS_BY_NAME = {t.name: t for t in TOOLS}
 # ------------------------------------------------------------------
 # 4. The graph:  START -> agent -> tools -> (agent | END)
 # ------------------------------------------------------------------
-llm = ChatOllama(model=CHAT_MODEL, temperature=0).bind_tools(TOOLS) # temperature=0 for deterministic answers, and bind_tools() so the model can call them
+llm = ChatOllama(model=CHAT_MODEL, temperature=0).bind_tools(TOOLS)
 
 # Built from DOCTORS, so the prompt always matches the real data (grounding, no invented doctors)
 DOCTOR_LIST = "\n".join(f"- {d['specialty']}: {d['name']} (id {i}), works {', '.join(d['days'])}"
                         for i, d in DOCTORS.items())
+
+# The next 7 days, worked out by code, so the LLM never has to calculate a date itself
+NEXT_7_DAYS = "\n".join(f"- {date.today() + timedelta(days=n):%A} = {date.today() + timedelta(days=n)}"
+                        for n in range(7))
 
 SYSTEM_PROMPT = f"""You are the appointment assistant for {CLINIC_NAME}.
 Today is {date.today():%A %Y-%m-%d}.
 
 The clinic has ONLY these doctors. Never mention any other doctor or specialty:
 {DOCTOR_LIST}
+
+Calendar for the next 7 days (use it, never calculate dates yourself):
+{NEXT_7_DAYS}
+When calling find_available_slots, pass the day in the patient's own words (e.g. "friday").
 
 Booking steps, in order:
 1. If the patient hasn't chosen a category, call list_doctors.
