@@ -1,14 +1,14 @@
 """Clinic Appointment Agent, built with LangChain + LangGraph.
 
-Same features as agent_plain.py. What changes:
   LangChain: ChatOllama (the model), @tool (tools and their schemas), a text splitter,
              embeddings, a vector store and a retriever (RAG)
-  LangGraph: a graph (agent node -> tools node -> agent), interrupt() for the patient's
-             confirmation, and a checkpointer for memory
+  LangGraph: a graph (agent node -> tools node -> agent or END), interrupt() for the
+             patient's confirmation, and a checkpointer for memory
 
 Run:  python agent_langgraph.py
 """
 
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -19,16 +19,18 @@ from langchain_core.vectorstores import InMemoryVectorStore
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 from langchain_text_splitters import MarkdownHeaderTextSplitter
 from langgraph.checkpoint.memory import InMemorySaver
-from langgraph.graph import START, MessagesState, StateGraph
+from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode, tools_condition
 from langgraph.types import Command, interrupt
 
+CLINIC_NAME = "City Care Clinic"
 CHAT_MODEL = "llama3.1:8b"
 EMBED_MODEL = "nomic-embed-text"
 MIN_HOURS_BEFORE_CHANGE = 24  # appointments can be changed only this many hours before
+SHOW_STEPS = True             # print each tool call (handy for demos and debugging)
 
 # ------------------------------------------------------------------
-# 1. Clinic data (fake, kept in memory) - same as agent_plain.py
+# 1. Clinic data (fake, kept in memory)
 # ------------------------------------------------------------------
 DOCTORS = {
     "D1": {"name": "Dr. Sarah Khan", "specialty": "general", "days": ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]},
@@ -47,7 +49,19 @@ def to_date(day: str) -> date:
         return date.today()
     if day == "tomorrow":
         return date.today() + timedelta(days=1)
-    return date.fromisoformat(day)
+    try:
+        return date.fromisoformat(day)
+    except ValueError:
+        raise ValueError(f"'{day}' is not a valid day. Use today, tomorrow or YYYY-MM-DD.") from None
+
+
+def find_doctor(doctor: str) -> str | None:
+    """Accept a doctor id ('D2') or a name ('Dr. Omar Malik', 'omar malik'). Returns the id."""
+    key = doctor.strip().lower().removeprefix("dr.").strip()
+    for doctor_id, info in DOCTORS.items():
+        if key == doctor_id.lower() or key in info["name"].lower():
+            return doctor_id
+    return None
 
 
 def free_times(doctor_id: str, d: date) -> list[str]:
@@ -70,72 +84,94 @@ def free_times(doctor_id: str, d: date) -> list[str]:
 # ------------------------------------------------------------------
 # 2. RAG with LangChain: split -> embed -> store -> retrieve
 # ------------------------------------------------------------------
-faq_text = Path(__file__).with_name("faq.md").read_text(encoding="utf-8")
-splitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("##", "section")], strip_headers=False)
-chunks = splitter.split_text(faq_text)                              # one Document per "## " section
-vector_store = InMemoryVectorStore(OllamaEmbeddings(model=EMBED_MODEL))
-vector_store.add_documents(chunks)                                  # embeds every chunk once
-retriever = vector_store.as_retriever(search_kwargs={"k": 2})       # returns the top-2 chunks
+def build_retriever():
+    faq_text = Path(__file__).with_name("faq.md").read_text(encoding="utf-8")
+    splitter = MarkdownHeaderTextSplitter(headers_to_split_on=[("##", "section")], strip_headers=False)
+    chunks = splitter.split_text(faq_text)                          # one Document per "## " section
+    store = InMemoryVectorStore(OllamaEmbeddings(model=EMBED_MODEL))
+    store.add_documents(chunks)                                     # embeds every chunk once
+    return store.as_retriever(search_kwargs={"k": 2})               # returns the top-2 chunks
+
+
+try:
+    retriever = build_retriever()
+except Exception as error:  # usually: Ollama isn't running, or the embedding model isn't pulled
+    sys.exit(f"Could not start the assistant: {error}\n"
+             f"Check that Ollama is running, then run:  ollama pull {EMBED_MODEL}")
 
 
 # ------------------------------------------------------------------
-# 3. Tools: @tool turns each function + docstring into a schema for the model
+# 3. Tools
+#    return_direct=True means the tool's text goes straight to the patient,
+#    so important lists can't be dropped or changed by the model.
 # ------------------------------------------------------------------
 def ask_patient_to_confirm(question: str) -> bool:
-    """Human-in-the-loop with LangGraph: interrupt() pauses the whole graph here.
-    The app shows the question, and the patient's answer comes back as the return value."""
+    """Human-in-the-loop: interrupt() pauses the graph until the patient answers."""
     answer = interrupt(question)
     return str(answer).strip().lower() in {"yes", "y"}
 
 
-@tool
+@tool # turning functions into tools with @tool decorator, so the model can call them
+      # the model sees the docstring as a description of what the tool does, and the function signature as a JSON schema for its arguments
 def search_clinic_info(question: str) -> str:
     """Search clinic information: fees, opening hours, location, payment and cancellation policy."""
     docs = retriever.invoke(question)
     return "\n\n".join(doc.page_content for doc in docs)
 
 
-@tool
+@tool(return_direct=True) # the answer goes straight to the patient, so the model can't drop or change it
 def list_doctors() -> str:
-    """List all doctors with their specialty (category) and working days."""
-    lines = []
-    for doctor_id, doctor in DOCTORS.items():
-        lines.append(f"{doctor['specialty'].title()}: {doctor['name']} (id {doctor_id}), "
-                     f"works {', '.join(doctor['days'])}")
+    """Show the patient all categories (specialties) with their doctors and working days."""
+    lines = ["We have the following categories:"]
+    for number, doctor in enumerate(DOCTORS.values(), start=1):
+        lines.append(f"  {number}. {doctor['specialty'].title()} - {doctor['name']} "
+                     f"({', '.join(doctor['days'])})")
+    lines.append("Which category would you like to book?")
     return "\n".join(lines)
 
+# list_doctors() and find_available_slots() are return_direct=True because the answers go straight to the patient
+# the other tools are not return_direct because they are more like actions (booking, rescheduling) and their output can be summarized by the model.
 
-@tool
+@tool(return_direct=True)
 def find_available_slots(specialty: Literal["general", "dermatology", "pediatrics"], day: str) -> str:
-    """Find free appointment times for a specialty. day is 'today', 'tomorrow' or YYYY-MM-DD."""
+    """Show the patient the free appointment times for a specialty on a day.
+    day is 'today', 'tomorrow' or YYYY-MM-DD."""
     d = to_date(day)
-    lines = [f"Date: {d:%A} {d.isoformat()}"]
+    lines = [f"Available times on {d:%A, %d %B %Y}:"]
+    any_free = False
     for doctor_id, doctor in DOCTORS.items():
-        if doctor["specialty"] == specialty:
-            times = free_times(doctor_id, d)
-            lines.append(f"{doctor['name']} (id {doctor_id}): {', '.join(times) or 'not available'}")
+        if doctor["specialty"] != specialty:
+            continue
+        times = free_times(doctor_id, d)
+        if times:
+            any_free = True
+            lines.append(f"  {doctor['name']}: {', '.join(times)}")
             SHOWN_SLOTS.update((doctor_id, d.isoformat(), t) for t in times)  # remember what was shown
+        else:
+            lines.append(f"  {doctor['name']}: not available (works {', '.join(doctor['days'])})")
+    lines.append("Which time would you like?" if any_free else "Which other day would suit you?")
     return "\n".join(lines)
 
 
 @tool
-def book_appointment(doctor_id: str, day: str, time: str, patient_name: str) -> str:
-    """Book an appointment. Use only after the patient has picked a doctor and a time from
-    find_available_slots and given their name. day is YYYY-MM-DD, time is HH:MM."""
-    if doctor_id not in DOCTORS:
-        return f"Error: unknown doctor id {doctor_id}. Use list_doctors."
+def book_appointment(doctor: str, day: str, time: str, patient_name: str) -> str:
+    """Book an appointment after the patient has picked a time from find_available_slots and
+    given their name. doctor is the doctor's id or name, day is YYYY-MM-DD, time is HH:MM."""
+    doctor_id = find_doctor(doctor)
+    if doctor_id is None:
+        return f"Error: unknown doctor '{doctor}'."
     d = to_date(day)
     if (doctor_id, d.isoformat(), time) not in SHOWN_SLOTS:
         return "First show the patient the available slots with find_available_slots, then let them pick one."
     if time not in free_times(doctor_id, d):
-        return f"Sorry, {time} is not free. Please choose another time."
-    doctor = DOCTORS[doctor_id]["name"]
-    if not ask_patient_to_confirm(f"Confirm: {patient_name} with {doctor} on {d:%A %Y-%m-%d} at {time}?"):
+        return f"Sorry, {time} is no longer free. Please choose another time."
+    name = DOCTORS[doctor_id]["name"]
+    if not ask_patient_to_confirm(f"Confirm: {patient_name} with {name} on {d:%A, %d %B} at {time}?"):
         return "The patient did not confirm. Nothing was booked."
     booking = {"id": len(BOOKINGS) + 1, "doctor_id": doctor_id, "date": d.isoformat(),
                "time": time, "patient": patient_name}
     BOOKINGS.append(booking)
-    return f"Booked {doctor} on {d:%A %Y-%m-%d} at {time} for {patient_name} (booking id {booking['id']})."
+    return f"Booked: {name} on {d:%A, %d %B %Y} at {time} for {patient_name}. Booking id {booking['id']}."
 
 
 @tool
@@ -150,8 +186,8 @@ def my_appointments(patient_name: str) -> str:
 
 @tool
 def reschedule_appointment(booking_id: int, new_day: str, new_time: str) -> str:
-    """Change an appointment to a new day and time with the same doctor. Use only after showing
-    free times with find_available_slots. new_day is YYYY-MM-DD, new_time is HH:MM."""
+    """Move an appointment to a new day and time with the same doctor, after showing free times
+    with find_available_slots. new_day is YYYY-MM-DD, new_time is HH:MM."""
     booking = next((b for b in BOOKINGS if b["id"] == int(booking_id)), None)
     if booking is None:
         return f"Error: no booking found with id {booking_id}."
@@ -164,51 +200,49 @@ def reschedule_appointment(booking_id: int, new_day: str, new_time: str) -> str:
         return "First show the patient the available slots with find_available_slots, then let them pick one."
     if new_time not in free_times(doctor_id, d):
         return f"Sorry, {new_time} is not free. Please choose another time."
-    doctor = DOCTORS[doctor_id]["name"]
-    if not ask_patient_to_confirm(f"Move booking {booking_id} with {doctor} from {booking['date']} "
+    name = DOCTORS[doctor_id]["name"]
+    if not ask_patient_to_confirm(f"Move booking {booking_id} with {name} from {booking['date']} "
                                   f"{booking['time']} to {d.isoformat()} {new_time}?"):
         return "The patient did not confirm. Nothing was changed."
     booking["date"], booking["time"] = d.isoformat(), new_time
-    return f"Rescheduled booking {booking_id} to {d:%A %Y-%m-%d} at {new_time} with {doctor}."
+    return f"Rescheduled booking {booking_id}: {name} on {d:%A, %d %B %Y} at {new_time}."
 
 
 TOOLS = [search_clinic_info, list_doctors, find_available_slots, book_appointment,
          my_appointments, reschedule_appointment]
+TOOLS_BY_NAME = {t.name: t for t in TOOLS}
 
 # ------------------------------------------------------------------
-# 4. The graph:  START -> agent -> (tool calls?) -> tools -> agent ... -> END
+# 4. The graph:  START -> agent -> tools -> (agent | END)
 # ------------------------------------------------------------------
-llm = ChatOllama(model=CHAT_MODEL, temperature=0).bind_tools(TOOLS)  # the model now knows the tools
+llm = ChatOllama(model=CHAT_MODEL, temperature=0).bind_tools(TOOLS) # temperature=0 for deterministic answers, and bind_tools() so the model can call them
 
-DOCTOR_LIST = "\n".join(
-    f"- {doc['specialty'].title()}: {doc['name']} (id {doc_id}), works {', '.join(doc['days'])}"
-    for doc_id, doc in DOCTORS.items()
-)
+# Built from DOCTORS, so the prompt always matches the real data (grounding, no invented doctors)
+DOCTOR_LIST = "\n".join(f"- {d['specialty']}: {d['name']} (id {i}), works {', '.join(d['days'])}"
+                        for i, d in DOCTORS.items())
 
-SYSTEM_PROMPT = f"""You are the appointment assistant for City Care Clinic (a demo clinic).
+SYSTEM_PROMPT = f"""You are the appointment assistant for {CLINIC_NAME}.
 Today is {date.today():%A %Y-%m-%d}.
 
-The clinic has ONLY these doctors:
+The clinic has ONLY these doctors. Never mention any other doctor or specialty:
 {DOCTOR_LIST}
-Never mention any other doctor or specialty.
 
-To book an appointment, follow these steps in order:
-1. If the patient hasn't chosen a category, call list_doctors and show the categories with
-   the doctor names. Ask which one they want.
-2. Ask which day, if they haven't said.
-3. Call find_available_slots and show the free times. Ask which time they want.
-4. Ask for the patient's name, if you don't know it.
+Booking steps, in order:
+1. If the patient hasn't chosen a category, call list_doctors.
+2. If they haven't said which day, ask.
+3. Call find_available_slots to show the free times.
+4. When they pick a time, ask for their name if you don't know it.
 5. Call book_appointment. The patient will be asked to confirm.
 
-To change an appointment:
-1. Ask for the patient's name and call my_appointments to find the booking id.
-2. Ask for the new day, call find_available_slots for that doctor's category, show the times.
+Changing an appointment:
+1. Ask for their name and call my_appointments to find the booking id.
+2. Ask for the new day and call find_available_slots for that doctor's specialty.
 3. Call reschedule_appointment. Changes are allowed only up to {MIN_HOURS_BEFORE_CHANGE} hours before.
 
-Other rules:
+Rules:
 - For fees, hours or policies, call search_clinic_info. Never make them up.
 - Do not give medical advice.
-- Keep answers short and friendly."""
+- Be polite, professional and brief."""
 
 
 def agent(state: MessagesState):
@@ -217,24 +251,37 @@ def agent(state: MessagesState):
     return {"messages": [response]}
 
 
-builder = StateGraph(MessagesState)                        # state = the list of messages
+def after_tools(state: MessagesState):
+    """Conditional edge after the tools node: if every tool that just ran is return_direct
+    (and succeeded), its text is the reply, so we end. Otherwise the agent continues."""
+    recent = []
+    for message in reversed(state["messages"]):
+        if message.type != "tool":
+            break
+        recent.append(message)
+    if recent and all(TOOLS_BY_NAME[m.name].return_direct and m.status != "error" for m in recent):
+        return END
+    return "agent"
+
+
+builder = StateGraph(MessagesState)
 builder.add_node("agent", agent)
-builder.add_node("tools", ToolNode(TOOLS, handle_tool_errors=True))  # runs the requested tools
+builder.add_node("tools", ToolNode(TOOLS, handle_tool_errors=True))
 builder.add_edge(START, "agent")
-builder.add_conditional_edges("agent", tools_condition)    # tool calls -> "tools", otherwise -> END
-builder.add_edge("tools", "agent")                         # after tools, back to the agent (the loop)
-graph = builder.compile(checkpointer=InMemorySaver())      # checkpointer = memory per thread_id
+builder.add_conditional_edges("agent", tools_condition)          # tool calls -> tools, else -> END
+builder.add_conditional_edges("tools", after_tools, ["agent", END])
+graph = builder.compile(checkpointer=InMemorySaver())             # memory per thread_id
 
 
 # ------------------------------------------------------------------
 # 5. Chat in the terminal
 # ------------------------------------------------------------------
 def run(payload, config) -> str | None:
-    """Run the graph, printing each tool call. Returns the confirmation question if it paused."""
-    for update in graph.stream(payload, config, stream_mode="updates"):  # one update per node
-        if "__interrupt__" in update:                 # a tool called interrupt(): the graph paused
+    """Run the graph. Returns the confirmation question if a tool paused it, else None."""
+    for update in graph.stream(payload, config, stream_mode="updates"):
+        if "__interrupt__" in update:
             return update["__interrupt__"][0].value
-        if "agent" in update:                         # show which tools the LLM asked for
+        if SHOW_STEPS and "agent" in update:
             for call in update["agent"]["messages"][-1].tool_calls:
                 print(f"   [tool] {call['name']} {call['args']}")
     return None
@@ -242,10 +289,17 @@ def run(payload, config) -> str | None:
 
 def main():
     config = {"configurable": {"thread_id": "patient-1"}}
-    print("City Care Clinic assistant. Type 'quit' to exit.")
+    print("=" * 60)
+    print(f"  {CLINIC_NAME} - Appointment Assistant")
+    print("=" * 60)
+    print("Hello! I can book or change an appointment, or answer questions")
+    print("about fees, timings and clinic policies. Type 'quit' to exit.\n")
+    print(list_doctors.invoke({}).replace("Which category would you like to book?", "").strip())
+
     while True:
         text = input("\nYou: ").strip()
-        if text.lower() in {"quit", "exit"}:
+        if text.lower() in {"quit", "exit", "bye"}:
+            print(f"Assistant: Thank you for contacting {CLINIC_NAME}. Take care!")
             break
         if not text:
             continue
